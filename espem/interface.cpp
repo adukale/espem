@@ -1,13 +1,14 @@
-#include "main.h"
-
+#include "espem.h"
 #include <EmbUI.h>
 #include "interface.h"
-#include "espem.h"
+#include "ui_i18n.h"    // localized GUI text-strings
 
 // статический класс с готовыми формами для базовых системных натсроек
 #include "basicui.h"
 
-#define MAX_POLL_PERIOD 60
+#define MAX_UI_UPDATE_RATE 30
+#define MAX_GPIO           39
+#define MAX_UART           2
 
 extern ESPEM *espem;
 
@@ -25,14 +26,18 @@ void create_parameters(){
     /**
      * регистрируем свои переменные
      */
-    embui.var_create(FPSTR(V_EPOLLRT), ESPEM_POLLRATE);         // Metrics collector pollrate
-    embui.var_create(FPSTR(V_EPFFIX), true);                    // PowerFactor value correction
-    embui.var_create(FPSTR(V_EPOLLENA), true);         	        // Meter poller active
-    embui.var_create(FPSTR(V_EPOOLSIZE), ESPEM_MEMPOOL);        // metrics collector mem pool size, KiB
-    embui.var_create(FPSTR(V_SMPLCNT), 0);                       // Metrics graph - number of samples to draw in a small power chart
+    embui.var_create(FPSTR(V_UI_UPDRT), DEFAULT_WS_UPD_RATE);       // WebUI update rate
+    embui.var_create(FPSTR(V_SMPL_PERIOD), 1);                      // 
+    embui.var_create(FPSTR(V_EPOOLSIZE), ESPEM_MEMPOOL);            // metrics collector mem pool size, KiB
+    embui.var_create(FPSTR(V_UART), 0x1);                           // default UART port UART_NUM_1
+    embui.var_create(FPSTR(V_RX), -1);                              // RX pin (default)
+    embui.var_create(FPSTR(V_TX), -1);                              // TX pin (default)
+    embui.var_create(FPSTR(V_TX), -1);                              // TX pin (default)
+    embui.var_create(FPSTR(V_EOFFSET), 0.0);                        // Energy counter offset
+
 
     //Metrics collector run/pause
-    embui.var_create(FPSTR(V_ECOLLECTORSTATE), 1);               // Collector state
+    //embui.var_create(FPSTR(V_ECOLLECTORSTATE), 1);                  // Collector state
 
     /**
      * обработчики действий
@@ -43,16 +48,19 @@ void create_parameters(){
 
 
    /**
-    * регистрируем статические секции для web-интерфейса с системными настройками,
+    * регистрируем статические секции для web-интерфейса с системными настройками
     */
-    BasicUI::add_sections();
+    basicui::add_sections();
 
 
     // активности
-    embui.section_handle_add(FPSTR(A_SET_ESPEM),  set_espem_opts);             // save matrix settings
+    embui.section_handle_add(FPSTR(A_SET_ESPEM),  set_sampler_opts);
+    embui.section_handle_add(FPSTR(A_SET_UART),   set_uart_opts);
+    embui.section_handle_add(FPSTR(A_SET_PZOPTS),   set_pzopts);
 
     // direct controls
-    embui.section_handle_add(FPSTR(A_DIRECT_CTL),  set_directctrls);             // process checkboxes with direct updates
+    embui.section_handle_add(FPSTR(A_DIRECT_CTL),  set_directctrls);             // process direct update controls
+
 
 }
 
@@ -79,11 +87,17 @@ void section_main_frame(Interface *interf, JsonObject *data){
 
     if(!embui.sysData.wifi_sta){                        // если контроллер не подключен к внешней AP, сразу открываем вкладку с настройками WiFi
         LOG(println, F("UI: Opening network setup section"));
-        BasicUI::block_settings_netw(interf, data);
+        basicui::block_settings_netw(interf, data);
     } else {
-        block_page_main(interf, data);                 // Строим основной блок 
+        block_page_main(interf, data);                  // Строим основной блок 
     }
 
+    interf->json_frame_flush();                         // Close interface section
+
+    // Publish firmware version (visible under menu section)
+    interf->json_frame_value();
+    interf->value(F("fwver"), F(FW_VERSION_STRING), true);
+    interf->json_frame_flush();
 }
 
 /**
@@ -100,7 +114,7 @@ void block_menu(Interface *interf, JsonObject *data){
     /**
      * добавляем в меню пункт - настройки,
      */
-    BasicUI::opt_setup(interf, data);       // пункт меню "настройки"
+    basicui::opt_setup(interf, data);       // пункт меню "настройки"
 
     interf->json_section_end();
 }
@@ -117,21 +131,22 @@ void block_page_main(Interface *interf, JsonObject *data){
 
     interf->json_section_line();             // "Live controls"
 
-    interf->checkbox(FPSTR(V_EPOLLENA), espem->meterPolling(), F("Meter Polling"), true);   // Meter poller status
-    // Poll Rate range slider
-    interf->range(FPSTR(V_EPOLLRT), embui.param(FPSTR(V_EPOLLRT)).toInt(), 1, MAX_POLL_PERIOD, 1, F("Poll Rate, sec"), true);
+    interf->checkbox(FPSTR(V_EPOLLENA), (bool)espem->get_uirate(), F("Live update"), true);   // Meter poller status
+    // UI update rate range slider
+    interf->range(FPSTR(V_UI_UPDRT), embui.paramVariant(FPSTR(V_UI_UPDRT)), 0, MAX_UI_UPDATE_RATE, 1, F("UI update rate, sec"), true);
     interf->json_section_end();     // end of line
 
     // Plain values display
     interf->json_section_line();             // "Live controls"
+    auto *m = espem->pz->getMetricsPZ004();
     // id, type, value, label, param
-    interf->display(F("pwr"), espem->meterData().power);     // Power
-    interf->display(F("cur"), espem->meterData().current);   // Current
-    interf->display(F("enrg"), espem->meterData().energy);   // Energy
+    interf->display(F("pwr"),  m->power/10 );      // Power
+    interf->display(F("cur"),  m->asFloat(pzmbus::meter_t::cur));   // Current
+    interf->display(F("enrg"), m->energy/1000);    // Energy
     interf->json_section_end();     // end of line
 
 
-    DynamicJsonDocument doc(128);
+    StaticJsonDocument<128> doc;
     JsonObject params = doc.to<JsonObject>();
     params[F("class")] = F("graphwide");    // css selector
 
@@ -141,11 +156,11 @@ void block_page_main(Interface *interf, JsonObject *data){
     interf->custom(F("gaugePF"), FPSTR(C_js), FPSTR(C_mkchart), FPSTR(C_DICT[lang][CD::PowerF]), params);    // Power Factor
     interf->json_section_end();     // end of line
 
-    params[F("arg1")] = embui.param(FPSTR(V_SMPLCNT));
+    params[F("arg1")] = embui.paramVariant(FPSTR(V_SMPLCNT));
     interf->custom(F("gsmini"), FPSTR(C_js), FPSTR(C_mkchart), F("Power chart"), params);
 
     // slider for the amount of metric samples to be plotted on a chart
-    interf->range(FPSTR(V_SMPLCNT), (int)embui.param(FPSTR(V_SMPLCNT)).toInt(), 0, (int)espem->getMetricsCap(), 10, FPSTR(C_DICT[lang][CD::MScale]), true);
+    interf->range(FPSTR(V_SMPLCNT), embui.paramVariant(FPSTR(V_SMPLCNT)).as<int>(), 0, (int)espem->getMetricsCap(), 10, FPSTR(C_DICT[lang][CD::MScale]), true);
 
     interf->json_frame_flush();     // flush frame
 }
@@ -163,26 +178,47 @@ void block_page_espemset(Interface *interf, JsonObject *data){
     interf->json_section_main("", FPSTR(C_DICT[lang][CD::ESPEMSet]));
 
     // Poller Line block
-    //interf->json_section_line(FPSTR(A_SET_ESPEM));
+    /*
     interf->json_section_line("");
-    interf->checkbox(FPSTR(V_EPFFIX), espem->pffix(), F("Power-Factor Fix"), true);
     interf->checkbox(FPSTR(V_EPOLLENA), espem->meterPolling(), F("Meter Polling"), true);   // Meter poller status
 
-    // Poll Rate range slider
-    interf->range(FPSTR(V_EPOLLRT), embui.param(FPSTR(V_EPOLLRT)).toInt(), 1, MAX_POLL_PERIOD, 1, F("Poll Rate, sec"), true);
+    // UI update Rate range slider
+    interf->range(FPSTR(V_UI_UPDRT), embui.paramVariant(FPSTR(V_UI_UPDRT)).as<int>(), 0, MAX_UI_UPDATE_RATE, 1, F("UI refresh rate, sec"), true);
+    interf->json_section_end();     // end of line
+    */
+
+    interf->json_section_begin(FPSTR(A_SET_UART));
+
+    interf->json_section_line("");
+    interf->number(FPSTR(V_UART), "Uart port", 1, 0, MAX_UART);
+    interf->number(FPSTR(V_RX), "RX pin (-1 default)", 1, -1, MAX_GPIO);
+    interf->number(FPSTR(V_TX), "TX pin (-1 default)", 1, -1, MAX_GPIO);
     interf->json_section_end();     // end of line
 
+    interf->button_submit(FPSTR(A_SET_UART), FPSTR(T_DICT[lang][TD::D_Apply]), F("blue"));
+    interf->json_section_end();     // end of "uart"
 
-    interf->spacer(F("Metrics collector options"));         // Weather setup Note
+    // counter opts
+    interf->spacer(F("Energy counter options"));
+    interf->json_section_begin(FPSTR(A_SET_PZOPTS));
+    interf->number(FPSTR(V_EOFFSET), espem->getEnergyOffset(), "Energy counter offset");
+    interf->button_submit(FPSTR(A_SET_PZOPTS), FPSTR(T_DICT[lang][TD::D_Apply]), F("blue"));
+    interf->json_section_end();     // end of "energy"
+
+
+
+    interf->spacer(F("Metrics collector options"));
     String _msg(F("Metrics pool capacity: "));
+    _msg += espem->getMetricsSize();
+    _msg += "/";
     _msg += espem->getMetricsCap();                         // current number of metrics samples
     _msg += F(" samples");
 
     interf->constant(F("mcap"), _msg);
 
     interf->json_section_line(FPSTR(A_SET_ESPEM));
-    //interf->text(FPSTR(V_EPOOLSIZE), embui.param(FPSTR(V_EPOOLSIZE)), FPSTR(F("Metrics RAM pool size, KiB")), false);          // Memory pool for metrics data, KiB
-    interf->number(FPSTR(V_EPOOLSIZE), FPSTR(F("Metrics RAM pool size, KiB")));          // Memory pool for metrics data, KiB
+    interf->number(FPSTR(V_EPOOLSIZE), F("RAM pool size, samples"));          // Memory pool for metrics data, samples
+    interf->number(FPSTR(V_SMPL_PERIOD), "Sampling period");                  // sampling period, sec
     // Button "Apply Metrics pool settings"
     interf->button_submit(FPSTR(A_SET_ESPEM), FPSTR(T_DICT[lang][TD::D_Apply]), F("blue"));
     interf->json_section_end();     // end of line
@@ -193,13 +229,12 @@ void block_page_espemset(Interface *interf, JsonObject *data){
 	 *   1: Running and storing metrics in RAM
 	 *   2: Paused, collecting but not storing, memory reserved 
 	 */
-    interf->select(FPSTR(V_ECOLLECTORSTATE), embui.param(FPSTR(V_ECOLLECTORSTATE)), F("Metrics collector status"), true, false);
-    interf->option("0", F("Disabled"));
-    interf->option("1", F("Running"));
-    interf->option("2", F("Paused"));
-    interf->json_section_end();
+    interf->select(FPSTR(V_ECOLLECTORSTATE), (uint8_t)espem->get_collector_state(), F("Metrics collector status"), true, false);
+    interf->option(0, F("Disabled"));
+    interf->option(1, F("Running"));
+    interf->option(2, F("Paused"));
+    interf->json_section_end();     // select
 
-    interf->json_section_end();     // end of main
     interf->json_frame_flush();     // flush frame
 }
 
@@ -208,7 +243,7 @@ void block_page_espemset(Interface *interf, JsonObject *data){
  * обработчик статуса (периодического опроса контроллера веб-приложением)
  */
 void pubCallback(Interface *interf){
-    BasicUI::embuistatus(interf);
+    basicui::embuistatus(interf);
 }
 
 
@@ -217,14 +252,15 @@ void pubCallback(Interface *interf){
 /**
  *  Apply espem options values
  */
-void set_espem_opts(Interface *interf, JsonObject *data){
+void set_sampler_opts(Interface *interf, JsonObject *data){
     if (!data) return;
 
     SETPARAM(FPSTR(V_EPOOLSIZE));
+    SETPARAM(FPSTR(V_SMPL_PERIOD));
 
-    espem->poolResize((*data)[FPSTR(V_EPOOLSIZE)].as<unsigned int>());
+    espem->tsSet((*data)[FPSTR(V_EPOOLSIZE)].as<unsigned int>(), (*data)[FPSTR(V_SMPL_PERIOD)].as<unsigned int>());
     // display main page
-    block_page_main(interf, data);
+    if (interf) block_page_main(interf, nullptr);
 }
 
 
@@ -242,36 +278,40 @@ void set_directctrls(Interface *interf, JsonObject *data){
         String _s(FPSTR(V_EPFFIX));
         String _k(kv.key().c_str());
 
-        if (!_s.compareTo(_k)){
-           espem->pffix(kv.value().as<unsigned short>());
-           SETPARAM(FPSTR(V_EPFFIX));
-           LOG(printf_P, PSTR("UI: Set PF fix to: %d\n"), espem->pffix() );
-           continue;
-        }
-
         _s=FPSTR(V_EPOLLENA);
         if (!_s.compareTo(_k)){
-           espem->meterPolling(kv.value().as<unsigned short>());
-           SETPARAM(FPSTR(V_EPOLLENA));
-           LOG(printf_P, PSTR("UI: Set Polling state to: %d\n"), espem->meterPolling() );
+           if(kv.value()){
+               espem->set_uirate(embui.paramVariant(FPSTR(V_UI_UPDRT)));
+           } else {
+               espem->set_uirate(0);
+           }
+           LOG(printf_P, PSTR("ESPEM: UI refresh state: %d\n"), kv.value().as<int>() );
            continue;
         }
 
-        _s=FPSTR(V_EPOLLRT);
+        _s=FPSTR(V_UI_UPDRT);
         if (!_s.compareTo(_k)){
-           espem->PollRate(kv.value().as<unsigned int>());
-           SETPARAM(FPSTR(V_EPOLLRT));
-           LOG(printf_P, PSTR("UI: Set Poll interval to: %d\n"), espem->PollRate() );
+           espem->set_uirate(kv.value().as<unsigned short>());
+           SETPARAM(FPSTR(V_UI_UPDRT));
+           LOG( printf_P, PSTR("ESPEM: Set UI update rate to: %d\n"), espem->get_uirate() );
            continue;
         }
+
 
         _s=FPSTR(V_ECOLLECTORSTATE);
         if (!_s.compareTo(_k)){
-            mcstate_t _a = espem->collector((mcstate_t)kv.value().as<unsigned short>());
-            embui.var(_k, String((uint8_t)_a));
-            LOG(printf_P, PSTR("UI: Changed Collector state to: %d\n"), (int)espem->collector() );
+            uint8_t new_state = kv.value().as<unsigned short>();
+            // reset TS Container if empty and we need to start it
+            if (espem->get_collector_state() == mcstate_t::MC_DISABLE && new_state >0) espem->tsSet(embui.paramVariant(FPSTR(V_EPOOLSIZE)), embui.paramVariant(FPSTR(V_SMPL_PERIOD)));
+
+            espem->set_collector_state((mcstate_t)new_state);
+            //embui.var(_k, (uint8_t)espem->set_collector_state((mcstate_t)new_state), true);   // no need to set this var, it's a run-time state
+            LOG(printf_P, PSTR("UI: Set TS Collector state to: %d\n"), (int)espem->get_collector_state() );
+            continue;
         }
 
+
+        // Set amount of samples displayed on chart (TODO: replace with js internal var)
         _s=FPSTR(V_SMPLCNT);
         if (!_s.compareTo(_k)){
             SETPARAM(FPSTR(V_SMPLCNT));
@@ -279,9 +319,51 @@ void set_directctrls(Interface *interf, JsonObject *data){
             if (interf){
                 interf->json_frame_custom(F("rawdata"));
                 interf->value(F("scntr"), kv.value());
+                interf->json_frame_flush();
             }
         }
     }
 
-    interf->json_frame_flush();
+}
+
+/**
+ *  Apply uart options values
+ */
+void set_uart_opts(Interface *interf, JsonObject *data){
+    if (!data) return;
+
+    uint8_t p = (*data)[FPSTR(V_UART)].as<unsigned short>();
+    if ( p <= MAX_UART ){
+        SETPARAM(FPSTR(V_UART));
+    } else return;
+
+    int r = (*data)[FPSTR(V_RX)].as<int>();
+    if (r <= MAX_GPIO && r >0) {
+        SETPARAM(FPSTR(V_RX));
+    } else return;
+
+    int t = (*data)[FPSTR(V_TX)].as<int>();
+    if (t <= MAX_GPIO && r >0){
+        SETPARAM(FPSTR(V_TX));
+    } else return;
+
+    espem->begin(embui.paramVariant(FPSTR(V_UART)), embui.paramVariant(FPSTR(V_RX)), embui.paramVariant(FPSTR(V_TX)));
+    // display main page
+    if (interf) block_page_main(interf, nullptr);
+}
+
+/**
+ * @brief Set pzem opts
+ * 
+ * @param interf 
+ * @param data 
+ */
+void set_pzopts(Interface *interf, JsonObject *data){
+    if (!data) return;
+
+    SETPARAM(FPSTR(V_EOFFSET));
+    espem->setEnergyOffset(embui.paramVariant(FPSTR(V_EOFFSET)));
+
+    // display main page
+    if (interf) block_page_main(interf, nullptr);
 }

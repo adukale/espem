@@ -18,13 +18,10 @@
 
 extern "C" int clock_gettime(clockid_t unused, struct timespec *tp);
 
+
 // PROGMEM strings
 // sprintf template for json version data
-#ifdef ESP8266
-static const char PGverjson[] PROGMEM = "{\"ChipID\":\"%x\",\"FlashSize\":%u,\"Core\":\"%s\",\"SDK\":\"%s\",\"firmware\":\"%s\",\"version\":\"%s\",\"CPUMHz\":%u,\"Heap\":%u,\"Uptime\":%u,}";
-#elif defined ESP32
-static const char PGverjson[] PROGMEM = "{\"ChipID\":\"%s\",\"FlashSize\":%u,\"SDK\":\"%s\",\"firmware\":\"%s\",\"version\":\"%s\",\"CPUMHz\":%u,\"Heap\":%u,\"Uptime\":%u,}";
-#endif
+static const char PGverjson[] = "{\"ChipID\":\"%s\",\"Flash\":%u,\"SDK\":\"%s\",\"firmware\":\"" FW_NAME "\",\"version\":\"" FW_VERSION_STRING "\",\"git\":\"%s\",\"CPUMHz\":%u,\"RAM Heap size\":%u,\"RAM Heap free\":%u,\"PSRAM size\":%u,\"PSRAM free\":%u,\"Uptime\":%u}";
 
 // Our instance of espem
 ESPEM *espem = nullptr;
@@ -42,19 +39,15 @@ void setup() {
   // Start framework, load config and connect WiFi
   embui.begin();
 
-
-  // restore ESPEM defaults configuration
-  ESPEM_CFG _cfg(embui.param(FPSTR(V_EPOLLRT)).toInt(),
-                  embui.param(FPSTR(V_EPOOLSIZE)).toInt(),
-                  (bool)embui.param(FPSTR(V_EPFFIX)).toInt(),
-                  (bool)embui.param(FPSTR(V_EPOLLENA)).toInt(),
-                  (mcstate_t)embui.param(FPSTR(V_ECOLLECTORSTATE)).toInt()
-  );
-
   // create and run ESPEM object
-  espem = new ESPEM(_cfg);
-  espem->begin();
+  espem = new ESPEM();
 
+  if (espem && espem->begin(embui.paramVariant(FPSTR(V_UART)), embui.paramVariant(FPSTR(V_RX)), embui.paramVariant(FPSTR(V_TX))) ){
+    if ( espem->tsSet( embui.paramVariant(FPSTR(V_EPOOLSIZE)), embui.paramVariant(FPSTR(V_SMPL_PERIOD)) ) ){
+      espem->set_collector_state(mcstate_t::MC_RUN);
+    }
+    espem->setEnergyOffset(embui.paramVariant(FPSTR(V_EOFFSET)));
+  }
 
   embui.server.on(PSTR("/fw"), HTTP_GET, [](AsyncWebServerRequest *request){
     wver(request);
@@ -67,13 +60,11 @@ void setup() {
 
   //sync_parameters();    // sync UI params
 
-  embui.setPubInterval(20);
+  embui.setPubInterval(WEBUI_PUBLISH_INTERVAL);
 }
-
 
 // MAIN loop
 void loop() {
-
   embui.handle();
 
 #ifdef USE_FTP
@@ -87,28 +78,19 @@ void wver(AsyncWebServerRequest *request) {
 
   timespec tp;
   clock_gettime(0, &tp);
-#ifdef ESP8266
-  snprintf_P(buff, sizeof(buff), PGverjson,
-    ESP.getChipId(),
-    ESP.getFlashChipSize(),
-    ESP.getCoreVersion().c_str(),
-    system_get_sdk_version(),
-    FW_NAME,
-    TOSTRING(FW_VER),
-    ESP.getCpuFreqMHz(),
-    ESP.getFreeHeap(),
-    (uint32_t)tp.tv_sec);
-#else
   snprintf_P(buff, sizeof(buff), PGverjson,
     ESP.getChipModel(),
     ESP.getFlashChipSize(),
     ESP.getSdkVersion(),
-    FW_NAME,
-    TOSTRING(FW_VER),
-    ESP.getCpuFreqMHz(),
-    ESP.getFreeHeap(),
-    (uint32_t)tp.tv_sec);
+#ifdef GIT_REV
+    GIT_REV,
+#else
+    "-",
 #endif
+    ESP.getCpuFreqMHz(),
+    ESP.getHeapSize(), ESP.getFreeHeap(),      // RAM
+    ESP.getPsramSize(), ESP.getFreePsram(),    // PSRAM
+    (uint32_t)tp.tv_sec);
 
 
   request->send(200, FPSTR(PGmimejson), buff );
