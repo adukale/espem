@@ -94,7 +94,7 @@ void wver(AsyncWebServerRequest *request) {
     ESP.getCoreVersion().c_str(),
     system_get_sdk_version(),
     FW_NAME,
-    TOSTRING(DFW_VER),
+    TOSTRING(FW_VER),
     ESP.getCpuFreqMHz(),
     ESP.getFreeHeap(),
     (uint32_t)tp.tv_sec);
